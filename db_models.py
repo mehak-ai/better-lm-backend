@@ -42,6 +42,7 @@ class Chunk(Base):
     page_number  = Column(Integer, default=1)
     chunk_index  = Column(Integer, default=0)
     global_index = Column(Integer, unique=True, nullable=True)
+    chunk_type   = Column(String(20), default="paragraph")  # heading|paragraph|table|image|caption
 
     document = relationship("Document", back_populates="chunks")
 
