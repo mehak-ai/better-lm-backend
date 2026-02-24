@@ -61,6 +61,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Catch-all handler so unhandled exceptions return JSON (with CORS headers
+    already injected by CORSMiddleware above) instead of crashing silently."""
+    logger.error("Unhandled exception on %s: %s", request.url, exc, exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc), "type": type(exc).__name__},
+    )
+
 # Serve uploaded media files
 app.mount("/media", StaticFiles(directory=str(config.MEDIA_ROOT)), name="media")
 
