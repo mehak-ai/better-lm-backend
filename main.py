@@ -49,10 +49,13 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Smart Research Agent API", version="2.0.0")
 
+# Build allowed origins: start with config list, always include known domains
+_cors_origins = list(config.CORS_ORIGINS)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=config.CORS_ORIGINS,
-    allow_origin_regex=r"https://.*\.trycloudflare\.com",
+    allow_origins=_cors_origins,
+    allow_origin_regex=r"https://(.*\.trycloudflare\.com|.*\.vercel\.app|.*\.railway\.app)",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
