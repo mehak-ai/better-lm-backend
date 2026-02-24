@@ -333,6 +333,37 @@ class IngestionService:
 # ---------------------------------------------------------------------------
 
 class CustomRetriever:
+    # Max chunks to load embeddings for — keyword filter narrows this down first
+    MAX_CANDIDATES = 80
+
+    @staticmethod
+    def _keyword_ids(db, query: str, document_ids: List[int]) -> List[int]:
+        """
+        Fast SQL pre-filter: return chunk IDs whose content contains at least
+        one meaningful query keyword. Returns [] if no keywords (caller falls back).
+        """
+        from db_models import Chunk
+        from sqlalchemy import or_
+
+        stopwords = {"the","a","an","is","are","was","were","of","in","on","at",
+                     "to","for","and","or","but","not","with","this","that","it"}
+        words = [w for w in re.findall(r"[a-zA-Z]{3,}", query.lower()) if w not in stopwords]
+        if not words:
+            return []
+
+        filters = [Chunk.content.ilike(f"%{w}%") for w in words[:6]]
+        rows = (
+            db.query(Chunk.id)
+            .filter(
+                Chunk.document_id.in_(document_ids),
+                Chunk.content != "[Image]",
+                or_(*filters),
+            )
+            .limit(CustomRetriever.MAX_CANDIDATES)
+            .all()
+        )
+        return [r.id for r in rows]
+
     @staticmethod
     def retrieve_documents(
         db,
@@ -345,14 +376,18 @@ class CustomRetriever:
         if not document_ids:
             return []
 
-        # Encode query once
-        query_vec = np.array(EmbeddingService.encode(query))
+        # ── Stage 1: keyword pre-filter (no embeddings loaded yet) ──
+        candidate_ids = CustomRetriever._keyword_ids(db, query, document_ids)
+        use_candidates = len(candidate_ids) > 0
+
+        # ── Encode query ──
+        query_vec = np.array(EmbeddingService.encode(query), dtype=np.float32)
         norm = np.linalg.norm(query_vec)
         if norm > 0:
             query_vec = query_vec / norm
 
-        # ── Single batched query across all documents (skip pure image chunks) ──
-        rows = (
+        # ── Stage 2: load embeddings only for candidates ──
+        q = (
             db.query(
                 Chunk.id,
                 Chunk.document_id,
@@ -364,24 +399,28 @@ class CustomRetriever:
                 Chunk.chunk_type,
             )
             .join(Document, Chunk.document_id == Document.id)
-            .filter(
-                Chunk.document_id.in_(document_ids),
-                Chunk.content != "[Image]",          # skip pure image placeholders
-            )
-            .all()
         )
+        if use_candidates:
+            q = q.filter(Chunk.id.in_(candidate_ids))
+        else:
+            # Fallback: no keywords matched, load capped set of all chunks
+            q = q.filter(
+                Chunk.document_id.in_(document_ids),
+                Chunk.content != "[Image]",
+            ).limit(CustomRetriever.MAX_CANDIDATES)
 
+        rows = q.all()
         if not rows:
             return []
 
-        # ── Vectorised cosine similarity in one NumPy call ──
+        # ── Stage 3: vectorised cosine similarity ──
         embs = np.array([r.embedding for r in rows], dtype=np.float32)
         norms = np.linalg.norm(embs, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
         embs_norm = embs / norms
-        scores = np.dot(embs_norm, query_vec.astype(np.float32))
+        scores = np.dot(embs_norm, query_vec)
 
-        # ── Collect + sort globally, then take top_k per document ──
+        # ── Stage 4: group by doc, top_k per doc, sort globally ──
         by_doc: Dict[int, List[Dict]] = {}
         for i, r in enumerate(rows):
             entry = {
