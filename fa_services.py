@@ -345,53 +345,61 @@ class CustomRetriever:
         if not document_ids:
             return []
 
+        # Encode query once
         query_vec = np.array(EmbeddingService.encode(query))
         norm = np.linalg.norm(query_vec)
         if norm > 0:
             query_vec = query_vec / norm
 
-        results = []
-        for doc_id in document_ids:
-            rows = (
-                db.query(
-                    Chunk.id,
-                    Chunk.document_id,
-                    Document.title.label("document_title"),
-                    Chunk.content,
-                    Chunk.page_number,
-                    Chunk.embedding,
-                    Chunk.global_index,
-                    Chunk.chunk_type,
-                )
-                .join(Document, Chunk.document_id == Document.id)
-                .filter(Chunk.document_id == doc_id)
-                .all()
+        # ── Single batched query across all documents (skip pure image chunks) ──
+        rows = (
+            db.query(
+                Chunk.id,
+                Chunk.document_id,
+                Document.title.label("document_title"),
+                Chunk.content,
+                Chunk.page_number,
+                Chunk.embedding,
+                Chunk.global_index,
+                Chunk.chunk_type,
             )
-            if not rows:
-                continue
+            .join(Document, Chunk.document_id == Document.id)
+            .filter(
+                Chunk.document_id.in_(document_ids),
+                Chunk.content != "[Image]",          # skip pure image placeholders
+            )
+            .all()
+        )
 
-            embs = np.array([r.embedding for r in rows])
-            norms = np.linalg.norm(embs, axis=1, keepdims=True)
-            norms[norms == 0] = 1.0
-            embs_norm = embs / norms
-            scores = np.dot(embs_norm, query_vec)
+        if not rows:
+            return []
 
-            scored = []
-            for i, r in enumerate(rows):
-                scored.append(
-                    {
-                        "chunk_id":       r.id,
-                        "document_id":    r.document_id,
-                        "document_title": r.document_title,
-                        "content":        r.content,
-                        "page_number":    r.page_number,
-                        "global_index":   r.global_index,
-                        "chunk_type":     getattr(r, "chunk_type", "paragraph"),
-                        "score":          float(scores[i]),
-                    }
-                )
-            scored.sort(key=lambda x: x["score"], reverse=True)
-            results.extend(scored[:top_k])
+        # ── Vectorised cosine similarity in one NumPy call ──
+        embs = np.array([r.embedding for r in rows], dtype=np.float32)
+        norms = np.linalg.norm(embs, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        embs_norm = embs / norms
+        scores = np.dot(embs_norm, query_vec.astype(np.float32))
+
+        # ── Collect + sort globally, then take top_k per document ──
+        by_doc: Dict[int, List[Dict]] = {}
+        for i, r in enumerate(rows):
+            entry = {
+                "chunk_id":       r.id,
+                "document_id":    r.document_id,
+                "document_title": r.document_title,
+                "content":        r.content,
+                "page_number":    r.page_number,
+                "global_index":   r.global_index,
+                "chunk_type":     r.chunk_type or "paragraph",
+                "score":          float(scores[i]),
+            }
+            by_doc.setdefault(r.document_id, []).append(entry)
+
+        results = []
+        for doc_chunks in by_doc.values():
+            doc_chunks.sort(key=lambda x: x["score"], reverse=True)
+            results.extend(doc_chunks[:top_k])
 
         results.sort(key=lambda x: x["score"], reverse=True)
         return results
