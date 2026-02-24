@@ -80,12 +80,38 @@ ALLOWED_TYPES = {"pdf", "docx", "txt"}
 
 @app.on_event("startup")
 def on_startup():
-    """Create all DB tables if they don't exist yet (safe to run repeatedly)."""
+    """Create missing tables and safely add any new columns (no data loss)."""
     from database import Base, engine
     import db_models  # ensure all models are registered
+    import sqlalchemy as sa
+
     logger.info("Creating database tables if not exist...")
     Base.metadata.create_all(bind=engine)
-    logger.info("Database tables ready ✅")
+
+    # --- Safe column migrations (ADD COLUMN IF NOT EXISTS) ---
+    # Each entry: (table_name, column_name, column_definition)
+    migrations = [
+        ("research_agent_chunk",   "chunk_type",   "VARCHAR(20) DEFAULT 'paragraph'"),
+        ("research_agent_chunk",   "global_index", "BIGINT"),
+        ("research_agent_document","file_hash",     "VARCHAR(64)"),
+        ("research_agent_document","total_pages",   "INTEGER DEFAULT 0"),
+        ("research_agent_message", "sources",       "JSON"),
+        ("research_agent_message", "intent",        "VARCHAR(20) DEFAULT 'rag'"),
+    ]
+
+    with engine.connect() as conn:
+        for table, col, col_def in migrations:
+            try:
+                conn.execute(sa.text(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {col_def};"
+                ))
+                conn.commit()
+                logger.info("Migration applied: %s.%s", table, col)
+            except Exception as e:
+                conn.rollback()
+                logger.warning("Migration skipped (%s.%s): %s", table, col, e)
+
+    logger.info("Database ready ✅")
 
 
 # ---------------------------------------------------------------------------
